@@ -32,6 +32,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -41,14 +42,7 @@ import java.util.concurrent.atomic.LongAdder;
 import org.HdrHistogram.Histogram;
 import org.HdrHistogram.HistogramLogWriter;
 import org.HdrHistogram.Recorder;
-import org.apache.pulsar.client.api.ClientBuilder;
-import org.apache.pulsar.client.api.Consumer;
-import org.apache.pulsar.client.api.ConsumerBuilder;
-import org.apache.pulsar.client.api.MessageListener;
-import org.apache.pulsar.client.api.PulsarClient;
-import org.apache.pulsar.client.api.Schema;
-import org.apache.pulsar.client.api.SubscriptionInitialPosition;
-import org.apache.pulsar.client.api.SubscriptionType;
+import org.apache.pulsar.client.api.*;
 import org.apache.pulsar.client.api.transaction.Transaction;
 import org.apache.pulsar.client.impl.ConsumerBase;
 import org.apache.pulsar.client.impl.ConsumerImpl;
@@ -57,6 +51,9 @@ import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.testclient.utils.PaddingDecimalFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 public class PerformanceConsumer {
     private static final LongAdder messagesReceived = new LongAdder();
@@ -156,6 +153,9 @@ public class PerformanceConsumer {
 
         @Parameter(names = {"--batch-index-ack" }, description = "Enable or disable the batch index acknowledgment")
         public boolean batchIndexAck = false;
+
+        @Parameter(names = {"--test-reactor" }, description = "Test batch receive by reactor")
+        public boolean isReactor = false;
 
         @Parameter(names = { "-pm", "--pool-messages" }, description = "Use the pooled message", arity = 1)
         private boolean poolMessages = true;
@@ -368,7 +368,6 @@ public class PerformanceConsumer {
 
         List<Future<Consumer<ByteBuffer>>> futures = new ArrayList<>();
         ConsumerBuilder<ByteBuffer> consumerBuilder = pulsarClient.newConsumer(Schema.BYTEBUFFER) //
-                .messageListener(listener) //
                 .receiverQueueSize(arguments.receiverQueueSize) //
                 .maxTotalReceiverQueueSizeAcrossPartitions(arguments.maxTotalReceiverQueueSizeAcrossPartitions)
                 .acknowledgmentGroupTime(arguments.acknowledgmentsGroupingDelayMillis, TimeUnit.MILLISECONDS) //
@@ -379,6 +378,9 @@ public class PerformanceConsumer {
                 .poolMessages(arguments.poolMessages)
                 .replicateSubscriptionState(arguments.replicatedSubscription)
                 .autoScaledReceiverQueueSizeEnabled(arguments.autoScaledReceiverQueueSize);
+        if (!arguments.isReactor) {
+            consumerBuilder.messageListener(listener);
+        }
         if (arguments.maxPendingChunkedMessage > 0) {
             consumerBuilder.maxPendingChunkedMessage(arguments.maxPendingChunkedMessage);
         }
@@ -405,7 +407,52 @@ public class PerformanceConsumer {
             }
         }
         for (Future<Consumer<ByteBuffer>> future : futures) {
-            future.get();
+            Consumer<ByteBuffer> consumer = future.get();
+            if (arguments.isReactor) {
+                Flux<Messages<?>> messagesFlux = Flux.create(sink -> {
+                    sink.onRequest(l -> {
+                        if (arguments.testTime > 0) {
+                            if (System.nanoTime() > testEndTime) {
+                                log.info("------------------- DONE -----------------------");
+                                PerfClientUtils.exit(0);
+                                sink.complete();
+                            }
+                        }
+                        consumer.batchReceiveAsync().thenAccept(sink::next);
+                    });
+                });
+                messagesFlux.flatMapSequential(messages  -> {
+                    if (qRecorder != null) {
+                        qRecorder.recordValue(((ConsumerBase<?>) consumer).getTotalIncomingMessages());
+                    }
+                    log.info("[DEBUG] batch receive {}", messages.size());
+                    return Flux.fromIterable(messages).parallel()
+                            .runOn(Schedulers.boundedElastic()).flatMap(msg -> {
+                        long latencyMillis = System.currentTimeMillis() - msg.getPublishTime();
+                        if (latencyMillis >= 0) {
+                            if (latencyMillis >= MAX_LATENCY) {
+                                latencyMillis = MAX_LATENCY;
+                            }
+                            recorder.recordValue(latencyMillis);
+                            cumulativeRecorder.recordValue(latencyMillis);
+                        }
+
+                        messagesReceived.increment();
+                        bytesReceived.add(msg.size());
+
+                        totalMessagesReceived.increment();
+                        totalBytesReceived.add(msg.size());
+
+                        return Mono.fromCompletionStage(() -> consumer.acknowledgeAsync(msg)).doOnSuccess(v -> {
+                            totalMessageAck.increment();
+                            messageAck.increment();
+                        }).doOnError(throwable -> {
+                            log.error("Ack message {} failed with exception", msg, throwable);
+                            totalMessageAckFailed.increment();
+                        });
+                    }).then();
+                }, 1).subscribe();
+            }
         }
         log.info("Start receiving from {} consumers per subscription on {} topics", arguments.numConsumers,
                 arguments.numTopics);
