@@ -449,6 +449,10 @@ public class PerformanceConsumer {
                         }).doOnError(throwable -> {
                             log.error("Ack message {} failed with exception", msg, throwable);
                             totalMessageAckFailed.increment();
+                        }).doOnTerminate(() -> {
+                            if (arguments.poolMessages) {
+                                msg.release();
+                            }
                         });
                     }).then();
                 }, 1).subscribe();
